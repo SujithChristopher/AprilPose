@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 /.cargo/
+!/.cargo/
+/.cargo/*
+!/.cargo/config.toml
 /.uv-cache/
 /data/
 /outputs/
