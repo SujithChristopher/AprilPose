@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,14 @@ import msgpack as mp
 import msgpack_numpy as mpn
 import numpy as np
 from cv2 import aruco
+
+try:
+    from aprilpose_rust import refine_internal_lines_rust
+except ImportError:
+    refine_internal_lines_rust = None
+
+if os.environ.get("APRILPOSE_DISABLE_RUST") == "1":
+    refine_internal_lines_rust = None
 
 
 @dataclass(frozen=True)
@@ -326,27 +335,56 @@ def solve_pose(
     return True, rvec, tvec, float(np.sqrt(np.mean(errors * errors)))
 
 
-def refine_tag_from_internal_lines(
+def rust_internal_line_refinement(
     gray: np.ndarray,
-    corners: np.ndarray,
-    marker_id: int,
-    dictionary: cv2.aruco.Dictionary,
-    camera_matrix: np.ndarray,
-    marker_length: float,
+    cells: np.ndarray,
+    homography: np.ndarray,
     samples_per_segment: int,
     profile_radius: int,
     min_gradient: float,
     min_line_points: int,
     max_line_rms: float,
-) -> dict[str, object]:
-    cells = build_marker_cell_grid(dictionary, marker_id)
-    grid_size = int(cells.shape[0])
-    tag_corners = np.array(
-        [[0.0, 0.0], [grid_size, 0.0], [grid_size, grid_size], [0.0, grid_size]],
-        dtype=np.float64,
-    )
-    homography, _ = cv2.findHomography(tag_corners, corners.astype(np.float64))
+) -> tuple[dict[tuple[str, int], list[EdgePoint]], dict[tuple[str, int], tuple[np.ndarray, float, int]], np.ndarray, np.ndarray] | None:
+    if refine_internal_lines_rust is None:
+        return None
 
+    result = refine_internal_lines_rust(
+        np.ascontiguousarray(gray),
+        np.ascontiguousarray(cells),
+        np.ascontiguousarray(homography, dtype=np.float64),
+        samples_per_segment,
+        profile_radius,
+        min_gradient,
+        min_line_points,
+        max_line_rms,
+    )
+    line_records = np.asarray(result["line_records"], dtype=np.float64)
+    object_grid = np.asarray(result["object_grid"], dtype=np.float64)
+    image_xy = np.asarray(result["image_points"], dtype=np.float64)
+
+    lines: dict[tuple[str, int], tuple[np.ndarray, float, int]] = {}
+    for record in line_records:
+        orientation = "vertical" if int(record[0]) == 0 else "horizontal"
+        line_index = int(record[1])
+        line = np.asarray(record[2:5], dtype=np.float64)
+        rms = float(record[5])
+        count = int(record[6])
+        lines[(orientation, line_index)] = (line, rms, count)
+
+    return {}, lines, object_grid, image_xy
+
+
+def python_internal_line_refinement(
+    gray: np.ndarray,
+    cells: np.ndarray,
+    homography: np.ndarray,
+    samples_per_segment: int,
+    profile_radius: int,
+    min_gradient: float,
+    min_line_points: int,
+    max_line_rms: float,
+) -> tuple[dict[tuple[str, int], list[EdgePoint]], dict[tuple[str, int], tuple[np.ndarray, float, int]], np.ndarray, np.ndarray]:
+    grid_size = int(cells.shape[0])
     buckets: dict[tuple[str, int], list[EdgePoint]] = {}
     for segment in visible_edge_segments(cells):
         edge_points = detect_edge_points_for_segment(
@@ -385,8 +423,60 @@ def refine_tag_from_internal_lines(
             object_grid_points.append([float(col), float(row)])
             image_points.append(image_point)
 
-    object_grid = np.asarray(object_grid_points, dtype=np.float64)
-    image_xy = np.asarray(image_points, dtype=np.float64)
+    return (
+        buckets,
+        lines,
+        np.asarray(object_grid_points, dtype=np.float64),
+        np.asarray(image_points, dtype=np.float64),
+    )
+
+
+def refine_tag_from_internal_lines(
+    gray: np.ndarray,
+    corners: np.ndarray,
+    marker_id: int,
+    dictionary: cv2.aruco.Dictionary,
+    camera_matrix: np.ndarray,
+    marker_length: float,
+    samples_per_segment: int,
+    profile_radius: int,
+    min_gradient: float,
+    min_line_points: int,
+    max_line_rms: float,
+) -> dict[str, object]:
+    cells = build_marker_cell_grid(dictionary, marker_id)
+    grid_size = int(cells.shape[0])
+    tag_corners = np.array(
+        [[0.0, 0.0], [grid_size, 0.0], [grid_size, grid_size], [0.0, grid_size]],
+        dtype=np.float64,
+    )
+    homography, _ = cv2.findHomography(tag_corners, corners.astype(np.float64))
+
+    internal_result = rust_internal_line_refinement(
+        gray,
+        cells,
+        homography,
+        samples_per_segment=samples_per_segment,
+        profile_radius=profile_radius,
+        min_gradient=min_gradient,
+        min_line_points=min_line_points,
+        max_line_rms=max_line_rms,
+    )
+    backend = "rust"
+    if internal_result is None:
+        internal_result = python_internal_line_refinement(
+            gray,
+            cells,
+            homography,
+            samples_per_segment=samples_per_segment,
+            profile_radius=profile_radius,
+            min_gradient=min_gradient,
+            min_line_points=min_line_points,
+            max_line_rms=max_line_rms,
+        )
+        backend = "python"
+
+    buckets, lines, object_grid, image_xy = internal_result
     object_points = grid_to_object_points(object_grid, grid_size, marker_length)
     pose_ok, rvec, tvec, reprojection_rms = solve_pose(object_points, image_xy, camera_matrix)
 
@@ -412,6 +502,7 @@ def refine_tag_from_internal_lines(
         "corner_rvec": corner_rvec,
         "corner_tvec": corner_tvec,
         "corner_reprojection_rms": corner_rms,
+        "backend": backend,
     }
 
 
@@ -517,6 +608,7 @@ def main() -> None:
     print(f"corner_reprojection_rms_px={result['corner_reprojection_rms']}")
     print(f"refined_pose_ok={result['pose_ok']}")
     print(f"refined_reprojection_rms_px={result['reprojection_rms']}")
+    print(f"backend={result['backend']}")
     print(f"debug_image={args.output}")
 
     if result["pose_ok"]:

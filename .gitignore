@@ -8,5 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+/.cargo/
+/.uv-cache/
 /data/
 /outputs/
+/target/
