@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -183,6 +184,31 @@ def summarize(rows: list[dict[str, Any]], prefix: str) -> dict[str, float | int 
     }
 
 
+def summarize_timing(rows: list[dict[str, Any]]) -> dict[str, dict[str, float | None]]:
+    timing_keys = [
+        "undistort_ms",
+        "detection_ms",
+        "baseline_pose_ms",
+        "refinement_ms",
+        "baseline_pipeline_ms",
+        "refined_pipeline_ms",
+        "total_frame_ms",
+    ]
+
+    summary: dict[str, dict[str, float | None]] = {}
+    for key in timing_keys:
+        values = finite_values(rows, key)
+        if len(values) == 0:
+            summary[key] = {"mean": None, "median": None, "p95": None}
+            continue
+        summary[key] = {
+            "mean": float(np.mean(values)),
+            "median": float(np.median(values)),
+            "p95": float(np.percentile(values, 95)),
+        }
+    return summary
+
+
 def write_csv(rows: list[dict[str, Any]], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -190,6 +216,13 @@ def write_csv(rows: list[dict[str, Any]], output_path: Path) -> None:
         "time_s",
         "detected_ids",
         "selected_id",
+        "undistort_ms",
+        "detection_ms",
+        "baseline_pose_ms",
+        "refinement_ms",
+        "baseline_pipeline_ms",
+        "refined_pipeline_ms",
+        "total_frame_ms",
         "baseline_ok",
         "baseline_reprojection_rms_px",
         "baseline_delta_angle_deg",
@@ -257,6 +290,7 @@ def main() -> None:
     rows: list[dict[str, Any]] = []
 
     for frame_index, frame in enumerate(iter_msgpack(args.data)):
+        frame_started_at = time.perf_counter()
         timestamp_value = next(timestamp_iter, None) if timestamp_iter is not None else None
         if frame_index < args.start_frame:
             continue
@@ -268,18 +302,26 @@ def main() -> None:
         if undistort is None or camera_matrix is None:
             undistort, camera_matrix = make_undistorter(frame.shape, calibration)
 
+        undistort_started_at = time.perf_counter()
         gray = undistort(frame)
+        undistort_ms = (time.perf_counter() - undistort_started_at) * 1000.0
         timestamp_s = parse_timestamp(timestamp_value)
         if timestamp_s is None:
             timestamp_s = float(frame_index)
 
+        detection_started_at = time.perf_counter()
         corners_list, ids, _rejected = detector.detectMarkers(gray)
+        detection_ms = (time.perf_counter() - detection_started_at) * 1000.0
         detected_ids = [] if ids is None else ids.ravel().astype(int).tolist()
         row: dict[str, Any] = {
             "frame_index": frame_index,
             "time_s": timestamp_s,
             "detected_ids": " ".join(str(marker_id) for marker_id in detected_ids),
             "selected_id": args.tag_id,
+            "undistort_ms": undistort_ms,
+            "detection_ms": detection_ms,
+            "baseline_pose_ms": 0.0,
+            "refinement_ms": 0.0,
             "baseline_ok": False,
             "refined_ok": False,
             "line_count": 0,
@@ -290,17 +332,20 @@ def main() -> None:
             tag_index = detected_ids.index(args.tag_id)
             corners = corners_list[tag_index].reshape(4, 2)
 
+            baseline_started_at = time.perf_counter()
             baseline_ok, baseline_rvec, baseline_tvec, baseline_rms = baseline_pose(
                 corners,
                 camera_matrix,
                 calibration.marker_length,
             )
+            row["baseline_pose_ms"] = (time.perf_counter() - baseline_started_at) * 1000.0
             row["baseline_ok"] = baseline_ok
             row["baseline_rvec"] = baseline_rvec
             row["baseline_reprojection_rms_px"] = baseline_rms
             row.update(flatten_vector("baseline_rvec", baseline_rvec))
             row.update(flatten_vector("baseline_tvec", baseline_tvec))
 
+            refinement_started_at = time.perf_counter()
             result = refine_tag_from_internal_lines(
                 gray,
                 corners,
@@ -314,6 +359,7 @@ def main() -> None:
                 min_line_points=args.min_line_points,
                 max_line_rms=args.max_line_rms,
             )
+            row["refinement_ms"] = (time.perf_counter() - refinement_started_at) * 1000.0
             refined_rvec = result["rvec"] if result["pose_ok"] else None
             refined_tvec = result["tvec"] if result["pose_ok"] else None
             image_points = result["image_points"]
@@ -332,6 +378,9 @@ def main() -> None:
             row.update(flatten_vector("refined_rvec", None))
             row.update(flatten_vector("refined_tvec", None))
 
+        row["baseline_pipeline_ms"] = row["undistort_ms"] + row["detection_ms"] + row["baseline_pose_ms"]
+        row["refined_pipeline_ms"] = row["baseline_pipeline_ms"] + row["refinement_ms"]
+        row["total_frame_ms"] = (time.perf_counter() - frame_started_at) * 1000.0
         rows.append(row)
 
     add_rotation_metrics(rows, "baseline")
@@ -345,6 +394,7 @@ def main() -> None:
     print(f"csv={args.output}")
     print(f"baseline={baseline_summary}")
     print(f"refined={refined_summary}")
+    print(f"timing_ms={summarize_timing(rows)}")
 
 
 if __name__ == "__main__":
