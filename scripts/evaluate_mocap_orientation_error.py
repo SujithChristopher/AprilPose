@@ -244,6 +244,21 @@ def rebase_translation_to_first_frame(positions: np.ndarray) -> np.ndarray:
     return positions - positions[0]
 
 
+def kabsch_align(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    centroid_source = np.mean(source, axis=0)
+    centroid_target = np.mean(target, axis=0)
+    source_centered = source - centroid_source
+    target_centered = target - centroid_target
+    h = source_centered.T @ target_centered
+    u, _s, vt = np.linalg.svd(h)
+    rotation = vt.T @ u.T
+    if np.linalg.det(rotation) < 0:
+        vt[2, :] *= -1
+        rotation = vt.T @ u.T
+    translation = centroid_target - rotation @ centroid_source
+    return rotation, translation
+
+
 def rigid_align_points(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if len(source) != len(target) or len(source) == 0:
         raise ValueError("source and target must have matching non-empty lengths")
@@ -281,7 +296,15 @@ def plot_translation_comparison(
         return {"times": times, "positions": positions, "aligned_mocap": np.asarray([], dtype=np.float64).reshape(0, 3)}
 
     positions = rebase_translation_to_first_frame(positions)
-    aligned_mocap = align_translation_to_mocap(positions, mocap_positions[: len(positions)])
+    clean_mask = np.isfinite(positions).all(axis=1) & np.isfinite(mocap_positions[: len(positions)]).all(axis=1)
+    clean_tag = positions[clean_mask]
+    clean_mocap = mocap_positions[: len(positions)][clean_mask]
+    if len(clean_tag) == 0 or len(clean_mocap) == 0:
+        return {"times": times, "positions": positions, "aligned_mocap": np.asarray([], dtype=np.float64).reshape(0, 3)}
+
+    rotation, translation = kabsch_align(clean_mocap, clean_tag)
+    aligned_mocap = (rotation @ mocap_positions[: len(positions)].T).T + translation
+
     n = min(len(times), len(aligned_mocap))
     times = times[:n]
     positions = positions[:n]
@@ -427,19 +450,20 @@ def write_csv(rows: list[dict[str, Any]], output_path: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare AprilTag orientation trajectory against OptiTrack mocap.")
-    parser.add_argument("--data", type=Path, default=Path("data/3marker_april_mono_160fov_3/webcam_color.msgpack"))
+    default_recording = Path("data/ref_recording_single_april_diwakar")
+    parser.add_argument("--data", type=Path, default=default_recording / "webcam_color.msgpack")
     parser.add_argument(
         "--timestamps",
         type=Path,
-        default=Path("data/3marker_april_mono_160fov_3/webcam_timestamp.msgpack"),
+        default=default_recording / "webcam_timestamp.msgpack",
     )
     parser.add_argument(
         "--mocap-csv",
         type=Path,
-        default=Path("data/3marker_april_mono_160fov_3/3marker_april_mono_160fov_3.csv"),
+        default=default_recording / "ref_recording_single_april_diwakar.csv",
     )
-    parser.add_argument("--calibration", type=Path, default=Path("calibration/good.toml"))
-    parser.add_argument("--tag-id", type=int, default=14)
+    parser.add_argument("--calibration", type=Path, default=Path("calibration/diwakar_calibration.toml"))
+    parser.add_argument("--tag-id", type=int, default=12)
     parser.add_argument("--max-active-frames", type=int, default=300, help="Use 0 for all active mocap frames.")
     parser.add_argument("--euler-order", default="xyz")
     parser.add_argument("--samples-per-segment", type=int, default=5)
@@ -447,8 +471,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-gradient", type=float, default=8.0)
     parser.add_argument("--min-line-points", type=int, default=5)
     parser.add_argument("--max-line-rms", type=float, default=2.5)
-    parser.add_argument("--output", type=Path, default=Path("outputs/mocap_orientation_error.csv"))
-    parser.add_argument("--plot-dir", type=Path, default=None, help="Directory for generated PNG plots.")
+    parser.add_argument("--output", type=Path, default=default_recording / "mocap_orientation_error.csv")
+    parser.add_argument("--plot-dir", type=Path, default=default_recording, help="Directory for generated PNG plots.")
     return parser.parse_args()
 
 
