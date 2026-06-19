@@ -238,6 +238,12 @@ def translation_rows(rows: list[dict[str, Any]], prefix: str) -> tuple[np.ndarra
     return np.asarray(times, dtype=np.float64), np.asarray(positions, dtype=np.float64)
 
 
+def rebase_translation_to_first_frame(positions: np.ndarray) -> np.ndarray:
+    if len(positions) == 0:
+        return positions
+    return positions - positions[0]
+
+
 def rigid_align_points(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if len(source) != len(target) or len(source) == 0:
         raise ValueError("source and target must have matching non-empty lengths")
@@ -274,6 +280,7 @@ def plot_translation_comparison(
     if len(times) == 0 or len(mocap_positions) == 0:
         return {"times": times, "positions": positions, "aligned_mocap": np.asarray([], dtype=np.float64).reshape(0, 3)}
 
+    positions = rebase_translation_to_first_frame(positions)
     aligned_mocap = align_translation_to_mocap(positions, mocap_positions[: len(positions)])
     n = min(len(times), len(aligned_mocap))
     times = times[:n]
