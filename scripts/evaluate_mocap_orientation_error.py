@@ -488,6 +488,12 @@ def main() -> None:
     mocap_slerp = Slerp(mocap_times, mocap_rotations)
     dictionary = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36h11)
     detector = aruco.ArucoDetector(dictionary, aruco.DetectorParameters())
+    board = aruco.GridBoard(
+        size=[1, 1],
+        markerLength=calibration.marker_length,
+        markerSeparation=0.01,
+        dictionary=dictionary,
+    )
 
     undistort = None
     camera_matrix = None
@@ -518,6 +524,7 @@ def main() -> None:
 
         detection_started_at = time.perf_counter()
         corners_list, ids, _rejected = detector.detectMarkers(gray)
+        corners_list, ids, _rejected, _ = detector.refineDetectedMarkers(gray, board, corners_list, ids, _rejected)
         detection_ms = (time.perf_counter() - detection_started_at) * 1000.0
         detected_ids = [] if ids is None else ids.ravel().astype(int).tolist()
 
