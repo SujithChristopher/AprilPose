@@ -17,6 +17,7 @@ from datetime import datetime
     
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(1, os.path.dirname(_script_dir))
+sys.path.insert(1, os.path.join(os.path.dirname(_script_dir), 'scripts'))
 from pd_support import *
 from scipy.spatial.transform import Rotation as R
 import polars as pl
@@ -24,6 +25,7 @@ import os
 from scipy.interpolate import interp1d
 from joblib import Parallel, delayed
 import toml
+from line_refine_single_frame import refine_tag_from_internal_lines
 
 # %%
 _pth = os.path.dirname(_script_dir)
@@ -133,6 +135,8 @@ ar_results = {'corners': [], 'ids': [], 'rejected': []}
 
 tvecs = []
 rvecs = []
+refined_tvecs = []
+refined_rvecs = []
 for idx, _frame in tqdm(enumerate(_ref_data)):
     # if idx in _random_reference_frames_idx:
 
@@ -150,17 +154,33 @@ for idx, _frame in tqdm(enumerate(_ref_data)):
     # i want only id 12
     if res[1] is not None and 12 in res[1]:
         idx_12 = np.where(res[1] == 12)[0][0]
+        corners_12 = res[0][idx_12].reshape(-1, 1, 2)
+
         rvec, tvec = estimate_pose_single_markers(
-            corners=[res[0][idx_12].reshape(-1, 1, 2)],
+            corners=[corners_12],
             marker_size=markerLength,
             camera_matrix=new_camera_matrix,
             distortion_coefficients=np.zeros((5, 1))
         )
         tvecs.append(tvec[0])
         rvecs.append(rvec[0])
+
+        result = refine_tag_from_internal_lines(
+            _frame, corners_12.reshape(4, 2), 12, ARUCO_DICT, new_camera_matrix, markerLength,
+            samples_per_segment=5, profile_radius=5, min_gradient=8.0,
+            min_line_points=5, max_line_rms=2.5,
+        )
+        if result['pose_ok']:
+            refined_tvecs.append(result['tvec'].reshape(1, 3))
+            refined_rvecs.append(result['rvec'].reshape(1, 3))
+        else:
+            refined_tvecs.append(np.array([[np.nan, np.nan, np.nan]]))
+            refined_rvecs.append(np.array([[np.nan, np.nan, np.nan]]))
     else:
         tvecs.append(np.array([[np.nan, np.nan, np.nan]]))
         rvecs.append(np.array([[np.nan, np.nan, np.nan]]))
+        refined_tvecs.append(np.array([[np.nan, np.nan, np.nan]]))
+        refined_rvecs.append(np.array([[np.nan, np.nan, np.nan]]))
 
 
 # %%
@@ -209,10 +229,10 @@ _time_diff = mocap_df["time"][0] - ar_df["time"][0]
 ar_df = ar_df.with_columns([(pl.col("time") + _time_diff).alias("time")])
 
 # %%
-ar_tvecs = tvecs[start_pulse:end_pulse]
-ar_rvecs = rvecs[start_pulse:end_pulse]
-ar_tvecs = np.array(ar_tvecs)
-ar_rvecs = np.array(ar_rvecs)
+ar_tvecs = np.array(tvecs[start_pulse:end_pulse])
+ar_rvecs = np.array(rvecs[start_pulse:end_pulse])
+ar_refined_tvecs = np.array(refined_tvecs[start_pulse:end_pulse])
+ar_refined_rvecs = np.array(refined_rvecs[start_pulse:end_pulse])
 
 # %%
 mocap_df["time"][0]
@@ -397,57 +417,49 @@ def align_trajectories(source, target):
 
 tvecs = ar_tvecs.reshape(-1, 3)
 rvecs = ar_rvecs.reshape(-1, 3)
+refined_tvecs_flat = ar_refined_tvecs.reshape(-1, 3)
 
-# Vectorize transformation calculations using first valid marker as reference
+# Use first valid rvec as reference frame for both pipelines
 rmat = cv2.Rodrigues(rvecs[1])[0]
 rmat_T = rmat.T
 
-# Vectorized translation transformation
 tvec_diff = tvecs - tvecs[0]
 tvec_transformed = (rmat_T @ tvec_diff.T).T
 
-# axis flipped
-transformed_tvecs = tvec_transformed.copy()
-# transformed_tvecs[:, 0] = tvec_transformed[:, 1]
-# transformed_tvecs[:, 1] = tvec_transformed[:, 2]
-# transformed_tvecs[:, 2] = tvec_transformed[:, 0]
+refined_tvec_diff = refined_tvecs_flat - refined_tvecs_flat[0]
+refined_tvec_transformed = (rmat_T @ refined_tvec_diff.T).T
 
-# Vectorize error calculations
-_ex = np.nanmean(np.abs(transformed_tvecs[:, 0] - aligned_mocap[:, 0]))
-_ey = np.nanmean(np.abs(transformed_tvecs[:, 1] - aligned_mocap[:, 0]))
-_ez = np.nanmean(np.abs(transformed_tvecs[:, 2] - aligned_mocap[:, 0]))
 
-_mean_err = np.nanmean([_ex, _ey, _ez])
+def _error_stats(pred, ref):
+    errs = {ax: np.abs(pred[:, i] - ref[:, i]) for i, ax in enumerate('xyz')}
+    stats = {}
+    for ax, e in errs.items():
+        p95 = np.nanpercentile(e, 95)
+        stats[f'mean_{ax}']  = np.nanmean(e)
+        stats[f'max_{ax}']   = np.nanmax(e)
+        stats[f'p95_{ax}']   = np.nanmax(e[e <= p95])
+        stats[f'rmse_{ax}']  = np.sqrt(np.nanmean(e ** 2))
+    dist = np.linalg.norm(pred - ref, axis=1)
+    stats['rmse_3d'] = np.sqrt(np.nanmean(dist ** 2))
+    stats['mean_3d'] = np.nanmean(dist)
+    return stats
 
-# filtering out 95th percentile
+baseline_stats = _error_stats(tvec_transformed, aligned_mocap)
+refined_stats  = _error_stats(refined_tvec_transformed, aligned_mocap)
 
-_ex_arr = np.abs(transformed_tvecs[:, 0] - aligned_mocap[:, 0])
-_px = np.nanpercentile(_ex_arr, 95)
-_ex_p = np.nanmax(_ex_arr[_ex_arr <= _px])
+print("\n=== Baseline (image undistort + solvePnP) ===")
+for k, v in baseline_stats.items():
+    print(f"  {k}: {v:.4f} m")
 
-_ey_arr = np.abs(transformed_tvecs[:, 1] - aligned_mocap[:, 0])
-_py = np.nanpercentile(_ey_arr, 95)
-_ey_p = np.nanmax(_ey_arr[_ey_arr <= _py])
-    
-_ez_arr = np.abs(transformed_tvecs[:, 2] - aligned_mocap[:, 0])
-_pz = np.nanpercentile(_ez_arr, 95)
-_ez_p = np.nanmax(_ez_arr[_ez_arr <= _pz])
+print("\n=== Refined (+ Rust line refinement) ===")
+for k, v in refined_stats.items():
+    print(f"  {k}: {v:.4f} m")
 
-_max_x = np.nanmax(np.abs(transformed_tvecs[:, 0] - aligned_mocap[:, 0]))
-_max_y = np.nanmax(np.abs(transformed_tvecs[:, 1] - aligned_mocap[:, 0]))
-_max_z = np.nanmax(np.abs(transformed_tvecs[:, 2] - aligned_mocap[:, 0]))
-
-print(f"Max error: X={_max_x}, Y={_max_y}, Z={_max_z}")
-print(f"Max error 95th percentile: X={_ex_p}, Y={_ey_p}, Z={_ez_p}")
-
-# %%
-print(R_opt, t_opt)
-
-# %%
-_max_x = np.nanmax(np.abs(transformed_tvecs[:, 0] - aligned_mocap[:, 0]))
-_max_y = np.nanmax(np.abs(transformed_tvecs[:, 1] - aligned_mocap[:, 1]))
-_max_z = np.nanmax(np.abs(transformed_tvecs[:, 2] - aligned_mocap[:, 2]))
-print(f"Max error: X={_max_x}, Y={_max_y}, Z={_max_z}")
+print("\n=== Delta (refined - baseline, negative = improvement) ===")
+for k in baseline_stats:
+    delta = refined_stats[k] - baseline_stats[k]
+    arrow = "↓" if delta < 0 else ("↑" if delta > 0 else "=")
+    print(f"  {k}: {delta:+.4f} m  {arrow}")
 
 # %% [markdown]
 # ### Evaluating a section to see everything is right
@@ -455,47 +467,47 @@ print(f"Max error: X={_max_x}, Y={_max_y}, Z={_max_z}")
 # %%
 import matplotlib.pyplot as plt
 
-# Create a figure with 3 subplots (rows), sharing the same x-axis
-fig, axes = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
+fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
 
-# Subplot for X
-axes[0].plot(tvec_transformed[:, 0], label="cam x", color='tab:blue')
-axes[0].plot(aligned_mocap[:, 0], label="mocap x", color='tab:orange', linestyle='--')
-axes[0].set_ylabel("Translation (X)")
-axes[0].legend(loc="upper right")
-axes[0].grid(True, alpha=0.3)
-axes[0].set_ylim(-0.6, 0.6)
+specs = [
+    (0, "X", (-0.6, 0.6)),
+    (1, "Y", (-0.8, 0.8)),
+    (2, "Z", (-0.4, 0.4)),
+]
+for i, label, ylim in specs:
+    axes[i].plot(tvec_transformed[:, i],         label=f"baseline {label}", color='tab:blue',   alpha=0.8)
+    axes[i].plot(refined_tvec_transformed[:, i], label=f"refined {label}",  color='tab:green',  alpha=0.8)
+    axes[i].plot(aligned_mocap[:, i],            label=f"mocap {label}",    color='tab:orange', linestyle='--')
+    axes[i].set_ylabel(f"Translation ({label})")
+    axes[i].legend(loc="upper right")
+    axes[i].grid(True, alpha=0.3)
+    axes[i].set_ylim(*ylim)
 
-
-# Subplot for Y
-axes[1].plot(tvec_transformed[:, 1], label="cam y", color='tab:green')
-axes[1].plot(aligned_mocap[:, 1], label="mocap y", color='tab:red', linestyle='--')
-axes[1].set_ylabel("Translation (Y)")
-axes[1].legend(loc="upper right")
-axes[1].grid(True, alpha=0.3)
-axes[1].set_ylim(-0.8, 0.8)
-
-# Subplot for Z
-axes[2].plot(tvec_transformed[:, 2], label="cam z", color='tab:purple')
-axes[2].plot(aligned_mocap[:,2], label="mocap z", color='tab:brown', linestyle='--')
-# axes[2].plot(mocap_z, label="mocap z", color='tab:brown', linestyle='--')
-axes[2].set_ylabel("Translation (Z)")
-axes[2].set_xlabel("Frames / Time")
-axes[2].legend(loc="upper right")
-axes[2].grid(True, alpha=0.3)
-axes[2].set_ylim(-0.4, 0.4)
-
-# Adjust layout to prevent label overlapping
+axes[-1].set_xlabel("Frames / Time")
 plt.tight_layout()
-plt.suptitle("Camera vs Mocap Comparison", y=1.02, fontsize=14)
+plt.suptitle("Baseline vs Refined vs Mocap", y=1.02, fontsize=14)
 plt.show()
 
+fig2, axes2 = plt.subplots(1, 2, figsize=(14, 5))
+axes2[0].plot(aligned_mocap[:, 0],           aligned_mocap[:, 2],              label="mocap",    linestyle='--', color='tab:orange')
+axes2[0].plot(tvec_transformed[:, 0],        tvec_transformed[:, 2],           label="baseline", color='tab:blue')
+axes2[0].plot(refined_tvec_transformed[:, 0], refined_tvec_transformed[:, 2],  label="refined",  color='tab:green')
+axes2[0].set_xlabel("X (m)")
+axes2[0].set_ylabel("Z (m)")
+axes2[0].set_title("XZ trajectory")
+axes2[0].legend()
+axes2[0].grid(True, alpha=0.3)
 
-# %%
-plt.plot(aligned_mocap[:,0], aligned_mocap[:,2])
-# plt.plot(mocap_x, mocap_z)
-plt.plot(tvec_transformed[:, 0], tvec_transformed[:, 2])
-plt.legend()
+axes2[1].plot(aligned_mocap[:, 0],           aligned_mocap[:, 1],              label="mocap",    linestyle='--', color='tab:orange')
+axes2[1].plot(tvec_transformed[:, 0],        tvec_transformed[:, 1],           label="baseline", color='tab:blue')
+axes2[1].plot(refined_tvec_transformed[:, 0], refined_tvec_transformed[:, 1],  label="refined",  color='tab:green')
+axes2[1].set_xlabel("X (m)")
+axes2[1].set_ylabel("Y (m)")
+axes2[1].set_title("XY trajectory")
+axes2[1].legend()
+axes2[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
 plt.show()
 
 # %%
