@@ -137,6 +137,8 @@ tvecs = []
 rvecs = []
 refined_tvecs = []
 refined_rvecs = []
+refinement_accepted = []
+refinement_rejection_reasons = []
 for idx, _frame in tqdm(enumerate(_ref_data)):
     # if idx in _random_reference_frames_idx:
 
@@ -173,14 +175,20 @@ for idx, _frame in tqdm(enumerate(_ref_data)):
         if result['pose_ok']:
             refined_tvecs.append(result['tvec'].reshape(1, 3))
             refined_rvecs.append(result['rvec'].reshape(1, 3))
+            refinement_accepted.append(bool(result['refinement_accepted']))
+            refinement_rejection_reasons.append(result['rejection_reason'])
         else:
             refined_tvecs.append(np.array([[np.nan, np.nan, np.nan]]))
             refined_rvecs.append(np.array([[np.nan, np.nan, np.nan]]))
+            refinement_accepted.append(False)
+            refinement_rejection_reasons.append(result['rejection_reason'])
     else:
         tvecs.append(np.array([[np.nan, np.nan, np.nan]]))
         rvecs.append(np.array([[np.nan, np.nan, np.nan]]))
         refined_tvecs.append(np.array([[np.nan, np.nan, np.nan]]))
         refined_rvecs.append(np.array([[np.nan, np.nan, np.nan]]))
+        refinement_accepted.append(False)
+        refinement_rejection_reasons.append("tag_not_detected")
 
 
 # %%
@@ -233,6 +241,8 @@ ar_tvecs = np.array(tvecs[start_pulse:end_pulse])
 ar_rvecs = np.array(rvecs[start_pulse:end_pulse])
 ar_refined_tvecs = np.array(refined_tvecs[start_pulse:end_pulse])
 ar_refined_rvecs = np.array(refined_rvecs[start_pulse:end_pulse])
+ar_refinement_accepted = np.array(refinement_accepted[start_pulse:end_pulse], dtype=bool)
+ar_refinement_rejection_reasons = refinement_rejection_reasons[start_pulse:end_pulse]
 
 # %%
 mocap_df["time"][0]
@@ -447,11 +457,22 @@ def _error_stats(pred, ref):
 baseline_stats = _error_stats(tvec_transformed, aligned_mocap)
 refined_stats  = _error_stats(refined_tvec_transformed, aligned_mocap)
 
+valid_refinement_frames = np.isfinite(refined_tvecs_flat).all(axis=1)
+accepted_count = int(np.count_nonzero(ar_refinement_accepted))
+fallback_count = int(np.count_nonzero(valid_refinement_frames & ~ar_refinement_accepted))
+rejection_counts = {}
+for reason in ar_refinement_rejection_reasons:
+    if reason is not None:
+        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+
 print("\n=== Baseline (image undistort + solvePnP) ===")
 for k, v in baseline_stats.items():
     print(f"  {k}: {v:.4f} m")
 
 print("\n=== Refined (+ Rust line refinement) ===")
+print(f"  accepted refinements: {accepted_count}")
+print(f"  baseline fallbacks: {fallback_count}")
+print(f"  rejection reasons: {rejection_counts}")
 for k, v in refined_stats.items():
     print(f"  {k}: {v:.4f} m")
 
@@ -511,6 +532,5 @@ plt.tight_layout()
 plt.show()
 
 # %%
-
 
 

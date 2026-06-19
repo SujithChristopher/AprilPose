@@ -308,23 +308,30 @@ def solve_pose(
     object_points: np.ndarray,
     image_points: np.ndarray,
     camera_matrix: np.ndarray,
+    initial_rvec: np.ndarray | None = None,
+    initial_tvec: np.ndarray | None = None,
 ) -> tuple[bool, np.ndarray | None, np.ndarray | None, float | None]:
     if len(object_points) < 4:
         return False, None, None, None
 
-    ok, rvec, tvec = cv2.solvePnP(
-        object_points,
-        image_points.astype(np.float32),
-        camera_matrix,
-        None,
-        flags=cv2.SOLVEPNP_IPPE,
-    )
-    if not ok:
-        return False, None, None, None
+    image_points = image_points.astype(np.float32)
+    if initial_rvec is None or initial_tvec is None:
+        ok, rvec, tvec = cv2.solvePnP(
+            object_points,
+            image_points,
+            camera_matrix,
+            None,
+            flags=cv2.SOLVEPNP_IPPE,
+        )
+        if not ok:
+            return False, None, None, None
+    else:
+        rvec = np.asarray(initial_rvec, dtype=np.float64).reshape(3, 1).copy()
+        tvec = np.asarray(initial_tvec, dtype=np.float64).reshape(3, 1).copy()
 
     rvec, tvec = cv2.solvePnPRefineLM(
         object_points,
-        image_points.astype(np.float32),
+        image_points,
         camera_matrix,
         None,
         rvec,
@@ -333,6 +340,73 @@ def solve_pose(
     projected, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, None)
     errors = np.linalg.norm(projected.reshape(-1, 2) - image_points, axis=1)
     return True, rvec, tvec, float(np.sqrt(np.mean(errors * errors)))
+
+
+def pose_rotation_delta_degrees(rvec_a: np.ndarray, rvec_b: np.ndarray) -> float:
+    rotation_a = cv2.Rodrigues(np.asarray(rvec_a, dtype=np.float64).reshape(3, 1))[0]
+    rotation_b = cv2.Rodrigues(np.asarray(rvec_b, dtype=np.float64).reshape(3, 1))[0]
+    relative_rotation = rotation_a @ rotation_b.T
+    cosine = float(np.clip((np.trace(relative_rotation) - 1.0) * 0.5, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def pose_reprojection_rms(
+    object_points: np.ndarray,
+    image_points: np.ndarray,
+    camera_matrix: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+) -> float:
+    projected, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, None)
+    errors = np.linalg.norm(
+        projected.reshape(-1, 2) - np.asarray(image_points, dtype=np.float64).reshape(-1, 2),
+        axis=1,
+    )
+    return float(np.sqrt(np.mean(errors * errors)))
+
+
+def validate_refined_pose(
+    candidate_rvec: np.ndarray | None,
+    candidate_tvec: np.ndarray | None,
+    baseline_rvec: np.ndarray | None,
+    baseline_tvec: np.ndarray | None,
+    refined_corner_rms: float | None,
+    *,
+    max_translation_delta_m: float,
+    max_translation_delta_depth_ratio: float,
+    max_rotation_delta_deg: float,
+    max_corner_reprojection_rms: float,
+) -> tuple[bool, str | None, float | None, float | None]:
+    if candidate_rvec is None or candidate_tvec is None:
+        return False, "pose_solver_failed", None, None
+    if baseline_rvec is None or baseline_tvec is None:
+        return False, "baseline_pose_failed", None, None
+
+    candidate_tvec = np.asarray(candidate_tvec, dtype=np.float64).reshape(3)
+    baseline_tvec = np.asarray(baseline_tvec, dtype=np.float64).reshape(3)
+    if not np.all(np.isfinite(candidate_tvec)):
+        return False, "non_finite_translation", None, None
+    if candidate_tvec[2] <= 0.0:
+        return False, "non_positive_depth", None, None
+
+    translation_delta = float(np.linalg.norm(candidate_tvec - baseline_tvec))
+    translation_limit = max(
+        max_translation_delta_m,
+        max_translation_delta_depth_ratio * abs(float(baseline_tvec[2])),
+    )
+    if translation_delta > translation_limit:
+        return False, "translation_delta", translation_delta, None
+
+    rotation_delta = pose_rotation_delta_degrees(candidate_rvec, baseline_rvec)
+    if rotation_delta > max_rotation_delta_deg:
+        return False, "rotation_delta", translation_delta, rotation_delta
+
+    if refined_corner_rms is None or not np.isfinite(refined_corner_rms):
+        return False, "corner_reprojection_invalid", translation_delta, rotation_delta
+    if refined_corner_rms > max_corner_reprojection_rms:
+        return False, "corner_reprojection_rms", translation_delta, rotation_delta
+
+    return True, None, translation_delta, rotation_delta
 
 
 def rust_internal_line_refinement(
@@ -443,6 +517,10 @@ def refine_tag_from_internal_lines(
     min_gradient: float,
     min_line_points: int,
     max_line_rms: float,
+    max_translation_delta_m: float = 0.02,
+    max_translation_delta_depth_ratio: float = 0.10,
+    max_rotation_delta_deg: float = 10.0,
+    max_corner_reprojection_rms: float = 1.5,
 ) -> dict[str, object]:
     cells = build_marker_cell_grid(dictionary, marker_id)
     grid_size = int(cells.shape[0])
@@ -476,10 +554,6 @@ def refine_tag_from_internal_lines(
         )
         backend = "python"
 
-    buckets, lines, object_grid, image_xy = internal_result
-    object_points = grid_to_object_points(object_grid, grid_size, marker_length)
-    pose_ok, rvec, tvec, reprojection_rms = solve_pose(object_points, image_xy, camera_matrix)
-
     corner_object_grid = np.asarray([[0.0, 0.0], [grid_size, 0.0], [grid_size, grid_size], [0.0, grid_size]])
     corner_object = grid_to_object_points(corner_object_grid, grid_size, marker_length)
     corner_ok, corner_rvec, corner_tvec, corner_rms = solve_pose(
@@ -487,6 +561,49 @@ def refine_tag_from_internal_lines(
         corners.astype(np.float64),
         camera_matrix,
     )
+
+    buckets, lines, object_grid, image_xy = internal_result
+    object_points = grid_to_object_points(object_grid, grid_size, marker_length)
+    candidate_ok, candidate_rvec, candidate_tvec, candidate_reprojection_rms = solve_pose(
+        object_points,
+        image_xy,
+        camera_matrix,
+        initial_rvec=corner_rvec if corner_ok else None,
+        initial_tvec=corner_tvec if corner_ok else None,
+    )
+    refined_corner_rms = None
+    if candidate_ok and candidate_rvec is not None and candidate_tvec is not None:
+        refined_corner_rms = pose_reprojection_rms(
+            corner_object,
+            corners,
+            camera_matrix,
+            candidate_rvec,
+            candidate_tvec,
+        )
+
+    refinement_accepted, rejection_reason, translation_delta, rotation_delta = validate_refined_pose(
+        candidate_rvec if candidate_ok else None,
+        candidate_tvec if candidate_ok else None,
+        corner_rvec if corner_ok else None,
+        corner_tvec if corner_ok else None,
+        refined_corner_rms,
+        max_translation_delta_m=max_translation_delta_m,
+        max_translation_delta_depth_ratio=max_translation_delta_depth_ratio,
+        max_rotation_delta_deg=max_rotation_delta_deg,
+        max_corner_reprojection_rms=max_corner_reprojection_rms,
+    )
+    if refinement_accepted:
+        pose_ok = True
+        rvec = candidate_rvec
+        tvec = candidate_tvec
+        reprojection_rms = candidate_reprojection_rms
+        pose_source = "refined"
+    else:
+        pose_ok = corner_ok
+        rvec = corner_rvec
+        tvec = corner_tvec
+        reprojection_rms = corner_rms
+        pose_source = "baseline" if corner_ok else "none"
 
     return {
         "cells": cells,
@@ -498,6 +615,16 @@ def refine_tag_from_internal_lines(
         "rvec": rvec,
         "tvec": tvec,
         "reprojection_rms": reprojection_rms,
+        "pose_source": pose_source,
+        "refinement_accepted": refinement_accepted,
+        "rejection_reason": rejection_reason,
+        "candidate_pose_ok": candidate_ok,
+        "candidate_rvec": candidate_rvec,
+        "candidate_tvec": candidate_tvec,
+        "candidate_reprojection_rms": candidate_reprojection_rms,
+        "refined_corner_reprojection_rms": refined_corner_rms,
+        "translation_delta_m": translation_delta,
+        "rotation_delta_deg": rotation_delta,
         "corner_pose_ok": corner_ok,
         "corner_rvec": corner_rvec,
         "corner_tvec": corner_tvec,

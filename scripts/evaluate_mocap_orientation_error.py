@@ -411,10 +411,16 @@ def write_csv(rows: list[dict[str, Any]], output_path: Path) -> None:
         "total_frame_ms",
         "baseline_ok",
         "refined_ok",
+        "refinement_accepted",
+        "refinement_rejection_reason",
+        "refined_pose_source",
         "line_count",
         "intersection_count",
         "baseline_reprojection_rms_px",
         "refined_reprojection_rms_px",
+        "refined_corner_reprojection_rms_px",
+        "refined_translation_delta_m",
+        "refined_rotation_delta_deg",
     ]
 
     for prefix in ["mocap", "baseline", "baseline_rel", "refined", "refined_rel", "mocap_rel"]:
@@ -584,8 +590,14 @@ def main() -> None:
             lines = result["lines"]
 
             row["refined_ok"] = bool(result["pose_ok"])
+            row["refinement_accepted"] = bool(result["refinement_accepted"])
+            row["refinement_rejection_reason"] = result["rejection_reason"]
+            row["refined_pose_source"] = result["pose_source"]
             row["refined_rotation"] = rotation_from_rvec(refined_rvec) if result["pose_ok"] else None
             row["refined_reprojection_rms_px"] = result["reprojection_rms"]
+            row["refined_corner_reprojection_rms_px"] = result["refined_corner_reprojection_rms"]
+            row["refined_translation_delta_m"] = result["translation_delta_m"]
+            row["refined_rotation_delta_deg"] = result["rotation_delta_deg"]
             row["line_count"] = len(lines) if isinstance(lines, dict) else 0
             row["intersection_count"] = len(image_points) if isinstance(image_points, np.ndarray) else 0
             row.update(flatten_vector("refined_rvec", refined_rvec))
