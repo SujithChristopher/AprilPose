@@ -1,0 +1,26 @@
+notes = "Calibration performed using AprilTag 36h11 markers, with a 30mm lens. The calibration was validated against mocap data, and the optimal transformation was applied to align the camera's translation vectors with the mocap system."
+
+[calibration]
+camera_matrix = [ [ 596.1047123248906, 0.0, 626.3459464987894,], [ 0.0, 597.584826443287, 463.5685727393869,], [ 0.0, 0.0, 1.0,],]
+dist_coeffs = [ [ -0.042597263952256,], [ 0.012503613580062536,], [ -0.014463431294779176,], [ 0.0038363377733058933,],]
+reprojection_error = 0.618311473454879
+method = "fisheye"
+pattern_size = [ 6, 4,]
+notes = "Calibrated using k-means sampled frames from OV9281 160 FOV camera"
+
+[aruco]
+marker_length = 0.05
+marker_spacing = 0.01
+
+[camera]
+resolution = [ 1280, 800,]
+model = "OV9281"
+fov = 160
+
+[stream_data]
+udp = false
+ip = "localhost"
+port = 12345
+
+[display]
+display = false
