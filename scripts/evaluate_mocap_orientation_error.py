@@ -7,11 +7,17 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import matplotlib
 import msgpack as mp
 import msgpack_numpy as mpn
 import numpy as np
+import pandas as pd
 from cv2 import aruco
 from scipy.spatial.transform import Rotation, Slerp
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
 
 from evaluate_rotation_smoothness import (
     baseline_pose,
@@ -20,6 +26,7 @@ from evaluate_rotation_smoothness import (
     parse_timestamp,
     summarize_timing,
 )
+from pd_support import add_datetime_col, get_rb_marker_name, read_rigid_body_csv
 from line_refine_single_frame import load_calibration, refine_tag_from_internal_lines
 
 
@@ -40,28 +47,41 @@ def read_webcam_timestamps(path: Path) -> list[tuple[int, float]]:
     return timestamps
 
 
-def read_mocap_rotations(path: Path) -> tuple[np.ndarray, Rotation]:
-    times: list[float] = []
-    quaternions_xyzw: list[list[float]] = []
+def read_mocap_trajectory(path: Path) -> tuple[np.ndarray, np.ndarray, Rotation]:
+    mocap_df, st_time = read_rigid_body_csv(path)
+    mocap_df = add_datetime_col(mocap_df, st_time, "seconds")
 
-    with path.open(newline="", errors="replace") as file:
-        for row in csv.reader(file):
-            if not row or not row[0].isdigit() or len(row) < 6:
-                continue
-            values = row[2:6]
-            if not all(value.strip() for value in values):
-                continue
-            times.append(float(row[1]))
-            quat = [float(value) for value in values]
-            quat_norm = float(np.linalg.norm(quat))
-            if quat_norm < 1e-12:
-                continue
-            quaternions_xyzw.append([value / quat_norm for value in quat])
+    marker_names = [
+        get_rb_marker_name(5),
+        get_rb_marker_name(6),
+        get_rb_marker_name(4),
+        get_rb_marker_name(1),
+    ]
+    marker_positions = np.column_stack(
+        [
+            mocap_df[[marker_names[0]["x"], marker_names[1]["x"], marker_names[2]["x"], marker_names[3]["x"]]].to_numpy().mean(axis=1),
+            mocap_df[[marker_names[0]["y"], marker_names[1]["y"], marker_names[2]["y"], marker_names[3]["y"]]].to_numpy().mean(axis=1),
+            mocap_df[[marker_names[0]["z"], marker_names[1]["z"], marker_names[2]["z"], marker_names[3]["z"]]].to_numpy().mean(axis=1),
+        ]
+    )
 
-    if len(times) != len(quaternions_xyzw) or len(times) < 2:
+    quaternions_xyzw = mocap_df[["rb_ang_x", "rb_ang_y", "rb_ang_z", "rb_ang_w"]].to_numpy(dtype=np.float64)
+    quat_norms = np.linalg.norm(quaternions_xyzw, axis=1)
+    valid = quat_norms > 1e-12
+    if not np.any(valid):
         raise ValueError(f"Not enough valid mocap rotations in {path}")
+    quaternions_xyzw = quaternions_xyzw[valid] / quat_norms[valid][:, None]
+    positions_xyz = marker_positions[valid]
+    times = pd.to_datetime(mocap_df.loc[valid, "time"]).astype("int64") / 1e9
+    times = np.asarray(times, dtype=np.float64)
+    times = times - times[0]
 
-    return np.asarray(times, dtype=np.float64), Rotation.from_quat(np.asarray(quaternions_xyzw, dtype=np.float64))
+    rotation = Rotation.from_quat(quaternions_xyzw)
+    base_rotation = rotation[0].as_matrix()
+    base_position = positions_xyz[0]
+    transformed_positions = (base_rotation.T @ (positions_xyz - base_position).T).T
+
+    return times, transformed_positions, rotation
 
 
 def rotation_from_rvec(rvec: np.ndarray | None) -> Rotation | None:
@@ -198,6 +218,148 @@ def summarize_errors(rows: list[dict[str, Any]], prefix: str) -> dict[str, float
     return summary
 
 
+def translation_rows(rows: list[dict[str, Any]], prefix: str) -> tuple[np.ndarray, np.ndarray]:
+    times: list[float] = []
+    positions: list[list[float]] = []
+    for row in rows:
+        rotation = row.get(f"{prefix}_rotation")
+        tvec_x = row.get(f"{prefix}_tvec_x")
+        tvec_y = row.get(f"{prefix}_tvec_y")
+        tvec_z = row.get(f"{prefix}_tvec_z")
+        if rotation is None:
+            continue
+        if any(value is None or not np.isfinite(value) for value in [tvec_x, tvec_y, tvec_z]):
+            continue
+        times.append(float(row["active_time_s"]))
+        positions.append([float(tvec_x), float(tvec_y), float(tvec_z)])
+
+    if not times:
+        return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64).reshape(0, 3)
+    return np.asarray(times, dtype=np.float64), np.asarray(positions, dtype=np.float64)
+
+
+def rigid_align_points(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if len(source) != len(target) or len(source) == 0:
+        raise ValueError("source and target must have matching non-empty lengths")
+
+    source_centroid = source.mean(axis=0)
+    target_centroid = target.mean(axis=0)
+    source_centered = source - source_centroid
+    target_centered = target - target_centroid
+    h = source_centered.T @ target_centered
+    u, _s, vt = np.linalg.svd(h)
+    rotation = vt.T @ u.T
+    if np.linalg.det(rotation) < 0:
+        vt[-1, :] *= -1
+        rotation = vt.T @ u.T
+    translation = target_centroid - rotation @ source_centroid
+    return rotation, translation
+
+
+def align_translation_to_mocap(camera_positions: np.ndarray, mocap_positions: np.ndarray) -> np.ndarray:
+    if len(camera_positions) == 0 or len(mocap_positions) == 0:
+        return np.asarray([], dtype=np.float64).reshape(0, 3)
+    n = min(len(camera_positions), len(mocap_positions))
+    rotation, translation = rigid_align_points(camera_positions[:n], mocap_positions[:n])
+    return (rotation @ camera_positions.T).T + translation
+
+
+def plot_translation_comparison(
+    rows: list[dict[str, Any]],
+    plot_dir: Path,
+    prefix: str,
+    mocap_positions: np.ndarray,
+) -> dict[str, np.ndarray]:
+    times, positions = translation_rows(rows, prefix)
+    if len(times) == 0 or len(mocap_positions) == 0:
+        return {"times": times, "positions": positions, "aligned_mocap": np.asarray([], dtype=np.float64).reshape(0, 3)}
+
+    aligned_mocap = align_translation_to_mocap(positions, mocap_positions[: len(positions)])
+    n = min(len(times), len(aligned_mocap))
+    times = times[:n]
+    positions = positions[:n]
+    aligned_mocap = aligned_mocap[:n]
+
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    figure, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    axis_specs = [
+        ("x", 0, "tab:blue", "tab:orange"),
+        ("y", 1, "tab:green", "tab:red"),
+        ("z", 2, "tab:purple", "tab:brown"),
+    ]
+    for axis_label, axis_index, cam_color, mocap_color in axis_specs:
+        axes[axis_index].plot(times, positions[:, axis_index], label=f"{prefix} tvec {axis_label}", color=cam_color)
+        axes[axis_index].plot(
+            times,
+            aligned_mocap[:, axis_index],
+            label=f"mocap {axis_label}",
+            color=mocap_color,
+            linestyle="--",
+        )
+        axes[axis_index].set_ylabel(f"{axis_label} (m)")
+        axes[axis_index].grid(True, alpha=0.3)
+        axes[axis_index].legend(loc="best")
+    axes[-1].set_xlabel("time (s)")
+    figure.suptitle(f"{prefix.capitalize()} translation vs mocap")
+    figure.tight_layout()
+    figure.savefig(plot_dir / f"{prefix}_translation_vs_mocap.png", dpi=160)
+    plt.close(figure)
+
+    return {"times": times, "positions": positions, "aligned_mocap": aligned_mocap}
+
+
+def plot_xy_xz_trajectories(
+    plot_dir: Path,
+    baseline_positions: np.ndarray,
+    refined_positions: np.ndarray,
+    baseline_mocap: np.ndarray,
+    refined_mocap: np.ndarray,
+) -> None:
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    figure, axes = plt.subplots(1, 2, figsize=(13, 6))
+    axes[0].plot(baseline_positions[:, 0], baseline_positions[:, 1], label="baseline cam", color="tab:blue")
+    axes[0].plot(baseline_mocap[:, 0], baseline_mocap[:, 1], label="baseline mocap", color="tab:orange", linestyle="--")
+    axes[0].plot(refined_positions[:, 0], refined_positions[:, 1], label="refined cam", color="tab:green")
+    axes[0].plot(refined_mocap[:, 0], refined_mocap[:, 1], label="refined mocap", color="tab:red", linestyle="--")
+    axes[0].set_xlabel("x (m)")
+    axes[0].set_ylabel("y (m)")
+    axes[0].set_title("XY trajectory")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(loc="best")
+
+    axes[1].plot(baseline_positions[:, 0], baseline_positions[:, 2], label="baseline cam", color="tab:blue")
+    axes[1].plot(baseline_mocap[:, 0], baseline_mocap[:, 2], label="baseline mocap", color="tab:orange", linestyle="--")
+    axes[1].plot(refined_positions[:, 0], refined_positions[:, 2], label="refined cam", color="tab:green")
+    axes[1].plot(refined_mocap[:, 0], refined_mocap[:, 2], label="refined mocap", color="tab:red", linestyle="--")
+    axes[1].set_xlabel("x (m)")
+    axes[1].set_ylabel("z (m)")
+    axes[1].set_title("XZ trajectory")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend(loc="best")
+
+    figure.tight_layout()
+    figure.savefig(plot_dir / "trajectory_xy_xz_comparison.png", dpi=160)
+    plt.close(figure)
+
+
+def summarize_translation_error(camera_positions: np.ndarray, mocap_positions: np.ndarray) -> dict[str, float | None]:
+    if len(camera_positions) == 0 or len(mocap_positions) == 0:
+        return {
+            "mean_abs_error_m": None,
+            "rmse_m": None,
+            "median_abs_error_m": None,
+        }
+    n = min(len(camera_positions), len(mocap_positions))
+    error = camera_positions[:n] - mocap_positions[:n]
+    distances = np.linalg.norm(error, axis=1)
+    return {
+        "mean_abs_error_m": float(np.mean(distances)),
+        "rmse_m": float(np.sqrt(np.mean(distances * distances))),
+        "median_abs_error_m": float(np.median(distances)),
+    }
+
+
 def serializable_row(row: dict[str, Any], fieldnames: list[str]) -> dict[str, Any]:
     return {key: row.get(key) for key in fieldnames}
 
@@ -279,6 +441,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-line-points", type=int, default=5)
     parser.add_argument("--max-line-rms", type=float, default=2.5)
     parser.add_argument("--output", type=Path, default=Path("outputs/mocap_orientation_error.csv"))
+    parser.add_argument("--plot-dir", type=Path, default=None, help="Directory for generated PNG plots.")
     return parser.parse_args()
 
 
@@ -290,7 +453,7 @@ def main() -> None:
     if active_start is None:
         raise RuntimeError("No active mocap segment found in webcam timestamps")
 
-    mocap_times, mocap_rotations = read_mocap_rotations(args.mocap_csv)
+    mocap_times, mocap_positions, mocap_rotations = read_mocap_trajectory(args.mocap_csv)
     mocap_slerp = Slerp(mocap_times, mocap_rotations)
     dictionary = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36h11)
     detector = aruco.ArucoDetector(dictionary, aruco.DetectorParameters())
@@ -405,6 +568,22 @@ def main() -> None:
     add_euler_trajectory_columns(rows, args.euler_order)
     add_mocap_error_columns(rows)
     write_csv(rows, args.output)
+
+    plot_dir = args.plot_dir if args.plot_dir is not None else args.output.parent
+    baseline_plot = plot_translation_comparison(rows, plot_dir, "baseline", mocap_positions)
+    refined_plot = plot_translation_comparison(rows, plot_dir, "refined", mocap_positions)
+    if len(baseline_plot["positions"]) and len(refined_plot["positions"]):
+        plot_xy_xz_trajectories(
+            plot_dir,
+            baseline_plot["positions"],
+            refined_plot["positions"],
+            baseline_plot["aligned_mocap"],
+            refined_plot["aligned_mocap"],
+        )
+
+    print(f"plot_dir={plot_dir}")
+    print(f"baseline_translation_error={summarize_translation_error(baseline_plot['positions'], baseline_plot['aligned_mocap'])}")
+    print(f"refined_translation_error={summarize_translation_error(refined_plot['positions'], refined_plot['aligned_mocap'])}")
 
     print(f"active_frames_processed={len(rows)}")
     print(f"tag_id={args.tag_id}")

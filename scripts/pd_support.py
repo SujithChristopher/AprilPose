@@ -323,7 +323,7 @@ def read_rigid_body_csv(_pth):
 
     # reset index
     _rb_df = _rb_df.reset_index(drop=True)
-    _rb_df = _rb_df.apply(pd.to_numeric, errors="ignore")
+    _rb_df = _rb_df.apply(pd.to_numeric, errors="coerce")
 
     return _rb_df, st_time
 
