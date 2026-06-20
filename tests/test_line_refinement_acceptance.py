@@ -1,8 +1,13 @@
 import unittest
 
+import cv2
 import numpy as np
 
-from scripts.line_refine_single_frame import validate_refined_pose
+from scripts.line_refine_single_frame import (
+    refine_outer_corners_subpix,
+    solve_square_pose,
+    validate_refined_pose,
+)
 
 
 def validate(
@@ -74,6 +79,101 @@ class RefinedPoseAcceptanceTests(unittest.TestCase):
 
         self.assertFalse(accepted)
         self.assertEqual(reason, "corner_reprojection_rms")
+
+
+class OuterCornerCandidateTests(unittest.TestCase):
+    def test_subpixel_refinement_preserves_shape_and_input(self) -> None:
+        gray = np.zeros((80, 80), dtype=np.uint8)
+        gray[20:60, 20:60] = 255
+        corners = np.array(
+            [[19.5, 19.5], [59.5, 19.5], [59.5, 59.5], [19.5, 59.5]],
+            dtype=np.float64,
+        )
+        original = corners.copy()
+
+        refined = refine_outer_corners_subpix(gray, corners, window_radius=4)
+
+        self.assertEqual(refined.shape, (4, 2))
+        self.assertTrue(np.isfinite(refined).all())
+        np.testing.assert_array_equal(corners, original)
+
+    def test_ippe_square_recovers_synthetic_pose(self) -> None:
+        camera_matrix = np.array(
+            [[800.0, 0.0, 320.0], [0.0, 800.0, 240.0], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        marker_length = 0.05
+        half = marker_length * 0.5
+        object_points = np.array(
+            [
+                [-half, half, 0.0],
+                [half, half, 0.0],
+                [half, -half, 0.0],
+                [-half, -half, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        expected_rvec = np.array([0.15, -0.10, 0.05], dtype=np.float64)
+        expected_tvec = np.array([0.01, -0.02, 0.6], dtype=np.float64)
+        corners, _ = cv2.projectPoints(
+            object_points,
+            expected_rvec,
+            expected_tvec,
+            camera_matrix,
+            None,
+        )
+
+        ok, rvec, tvec, rms = solve_square_pose(
+            corners.reshape(4, 2),
+            camera_matrix,
+            marker_length,
+        )
+
+        self.assertTrue(ok)
+        self.assertIsNotNone(rvec)
+        self.assertIsNotNone(tvec)
+        self.assertIsNotNone(rms)
+        np.testing.assert_allclose(tvec.reshape(3), expected_tvec, atol=1e-5)
+        self.assertLess(rms, 1e-4)
+
+    def test_ippe_square_uses_reference_to_disambiguate_pose(self) -> None:
+        camera_matrix = np.array(
+            [[800.0, 0.0, 320.0], [0.0, 800.0, 240.0], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        marker_length = 0.05
+        half = marker_length * 0.5
+        object_points = np.array(
+            [
+                [-half, half, 0.0],
+                [half, half, 0.0],
+                [half, -half, 0.0],
+                [-half, -half, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        expected_rvec = np.array([0.02, -0.03, 0.01], dtype=np.float64)
+        expected_tvec = np.array([0.0, 0.0, 0.8], dtype=np.float64)
+        corners, _ = cv2.projectPoints(
+            object_points,
+            expected_rvec,
+            expected_tvec,
+            camera_matrix,
+            None,
+        )
+
+        ok, rvec, tvec, _rms = solve_square_pose(
+            corners.reshape(4, 2),
+            camera_matrix,
+            marker_length,
+            reference_rvec=expected_rvec,
+            reference_tvec=expected_tvec,
+        )
+
+        self.assertTrue(ok)
+        self.assertIsNotNone(rvec)
+        self.assertIsNotNone(tvec)
+        np.testing.assert_allclose(tvec.reshape(3), expected_tvec, atol=1e-5)
 
 
 if __name__ == "__main__":

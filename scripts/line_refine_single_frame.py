@@ -304,6 +304,129 @@ def grid_to_object_points(grid_points: np.ndarray, grid_size: int, marker_length
     return np.column_stack([xy, np.zeros(len(xy), dtype=np.float64)]).astype(np.float32)
 
 
+def refine_outer_corners_subpix(
+    gray: np.ndarray,
+    corners: np.ndarray,
+    *,
+    window_radius: int = 5,
+    max_iterations: int = 30,
+    epsilon: float = 1e-3,
+) -> np.ndarray:
+    """Refine detector corners without using the decoded internal tag pattern."""
+    if gray.ndim != 2:
+        raise ValueError(f"Expected a grayscale image, got shape {gray.shape}")
+    if window_radius < 1:
+        raise ValueError("window_radius must be at least 1")
+
+    refined = np.asarray(corners, dtype=np.float32).reshape(4, 1, 2).copy()
+    criteria = (
+        cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER,
+        max_iterations,
+        epsilon,
+    )
+    cv2.cornerSubPix(
+        gray,
+        refined,
+        (window_radius, window_radius),
+        (-1, -1),
+        criteria,
+    )
+    return refined.reshape(4, 2).astype(np.float64)
+
+
+def solve_square_pose(
+    corners: np.ndarray,
+    camera_matrix: np.ndarray,
+    marker_length: float,
+    *,
+    reference_rvec: np.ndarray | None = None,
+    reference_tvec: np.ndarray | None = None,
+) -> tuple[bool, np.ndarray | None, np.ndarray | None, float | None]:
+    """Estimate square-tag pose with OpenCV's dedicated planar square solver."""
+    half = marker_length * 0.5
+    object_points = np.asarray(
+        [
+            [-half, half, 0.0],
+            [half, half, 0.0],
+            [half, -half, 0.0],
+            [-half, -half, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    image_points = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+    solution_count, rvecs, tvecs, reprojection_errors = cv2.solvePnPGeneric(
+        object_points,
+        image_points,
+        camera_matrix,
+        None,
+        flags=cv2.SOLVEPNP_IPPE_SQUARE,
+    )
+    if solution_count < 1:
+        return False, None, None, None
+
+    if reference_rvec is None or reference_tvec is None:
+        selected_index = int(np.argmin(np.asarray(reprojection_errors).reshape(-1)))
+    else:
+        reference_rotation = cv2.Rodrigues(
+            np.asarray(reference_rvec, dtype=np.float64).reshape(3, 1)
+        )[0]
+        reference_translation = np.asarray(reference_tvec, dtype=np.float64).reshape(3)
+        reference_depth = max(abs(float(reference_translation[2])), 1e-6)
+        scores: list[float] = []
+        for candidate_rvec, candidate_tvec in zip(rvecs, tvecs, strict=True):
+            candidate_rotation = cv2.Rodrigues(candidate_rvec)[0]
+            relative_rotation = candidate_rotation @ reference_rotation.T
+            cosine = float(
+                np.clip((np.trace(relative_rotation) - 1.0) * 0.5, -1.0, 1.0)
+            )
+            rotation_delta_deg = float(np.degrees(np.arccos(cosine)))
+            translation_delta_ratio = float(
+                np.linalg.norm(candidate_tvec.reshape(3) - reference_translation)
+                / reference_depth
+            )
+            scores.append(rotation_delta_deg + 10.0 * translation_delta_ratio)
+        selected_index = int(np.argmin(scores))
+
+    rvec = rvecs[selected_index]
+    tvec = tvecs[selected_index]
+    projected, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, None)
+    errors = np.linalg.norm(projected.reshape(-1, 2) - image_points, axis=1)
+    rms = float(np.sqrt(np.mean(errors * errors)))
+    return True, rvec, tvec, rms
+
+
+def refine_pose_from_outer_corners_subpix(
+    gray: np.ndarray,
+    corners: np.ndarray,
+    camera_matrix: np.ndarray,
+    marker_length: float,
+    *,
+    window_radius: int = 5,
+    reference_rvec: np.ndarray | None = None,
+    reference_tvec: np.ndarray | None = None,
+) -> dict[str, object]:
+    """Benchmark candidate: subpixel outer corners followed by IPPE_SQUARE."""
+    refined_corners = refine_outer_corners_subpix(
+        gray,
+        corners,
+        window_radius=window_radius,
+    )
+    ok, rvec, tvec, reprojection_rms = solve_square_pose(
+        refined_corners,
+        camera_matrix,
+        marker_length,
+        reference_rvec=reference_rvec,
+        reference_tvec=reference_tvec,
+    )
+    return {
+        "pose_ok": ok,
+        "rvec": rvec,
+        "tvec": tvec,
+        "reprojection_rms": reprojection_rms,
+        "corners": refined_corners,
+    }
+
+
 def solve_pose(
     object_points: np.ndarray,
     image_points: np.ndarray,

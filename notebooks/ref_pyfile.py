@@ -1,5 +1,10 @@
 # %% [markdown]
-# # Analysis by using a second video
+# # Pose algorithm benchmark on the second video
+#
+# This file is the reference benchmark for pose algorithms. Every candidate is
+# evaluated on the same detected tag, synchronized camera interval, mocap
+# interpolation, translation alignment, SO(3) orientation-change metrics, and
+# per-frame runtime.
 
 # %%
 import sys
@@ -9,6 +14,7 @@ import numpy as np
 import msgpack as mp
 import msgpack_numpy as mpn
 import os
+import time
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 from joblib import Parallel, delayed
@@ -25,7 +31,10 @@ import os
 from scipy.interpolate import interp1d
 from joblib import Parallel, delayed
 import toml
-from line_refine_single_frame import refine_tag_from_internal_lines
+from line_refine_single_frame import (
+    refine_pose_from_outer_corners_subpix,
+    refine_tag_from_internal_lines,
+)
 
 # %%
 _pth = os.path.dirname(_script_dir)
@@ -137,8 +146,17 @@ tvecs = []
 rvecs = []
 refined_tvecs = []
 refined_rvecs = []
+subpix_tvecs = []
+subpix_rvecs = []
 refinement_accepted = []
 refinement_rejection_reasons = []
+algorithm_timings_ms = {
+    "baseline": [],
+    "subpix_ippe_temporal": [],
+    "internal_lines": [],
+}
+previous_subpix_rvec = None
+previous_subpix_tvec = None
 for idx, _frame in tqdm(enumerate(_ref_data)):
     # if idx in _random_reference_frames_idx:
 
@@ -158,19 +176,49 @@ for idx, _frame in tqdm(enumerate(_ref_data)):
         idx_12 = np.where(res[1] == 12)[0][0]
         corners_12 = res[0][idx_12].reshape(-1, 1, 2)
 
+        started_at = time.perf_counter()
         rvec, tvec = estimate_pose_single_markers(
             corners=[corners_12],
             marker_size=markerLength,
             camera_matrix=new_camera_matrix,
             distortion_coefficients=np.zeros((5, 1))
         )
+        algorithm_timings_ms["baseline"].append(
+            (time.perf_counter() - started_at) * 1000.0
+        )
         tvecs.append(tvec[0])
         rvecs.append(rvec[0])
 
+        started_at = time.perf_counter()
+        subpix_result = refine_pose_from_outer_corners_subpix(
+            _frame,
+            corners_12.reshape(4, 2),
+            new_camera_matrix,
+            markerLength,
+            window_radius=5,
+            reference_rvec=previous_subpix_rvec if previous_subpix_rvec is not None else rvec[0],
+            reference_tvec=previous_subpix_tvec if previous_subpix_tvec is not None else tvec[0],
+        )
+        algorithm_timings_ms["subpix_ippe_temporal"].append(
+            (time.perf_counter() - started_at) * 1000.0
+        )
+        if subpix_result["pose_ok"]:
+            subpix_tvecs.append(subpix_result["tvec"].reshape(1, 3))
+            subpix_rvecs.append(subpix_result["rvec"].reshape(1, 3))
+            previous_subpix_rvec = subpix_result["rvec"]
+            previous_subpix_tvec = subpix_result["tvec"]
+        else:
+            subpix_tvecs.append(np.array([[np.nan, np.nan, np.nan]]))
+            subpix_rvecs.append(np.array([[np.nan, np.nan, np.nan]]))
+
+        started_at = time.perf_counter()
         result = refine_tag_from_internal_lines(
             _frame, corners_12.reshape(4, 2), 12, ARUCO_DICT, new_camera_matrix, markerLength,
             samples_per_segment=5, profile_radius=5, min_gradient=8.0,
             min_line_points=5, max_line_rms=2.5,
+        )
+        algorithm_timings_ms["internal_lines"].append(
+            (time.perf_counter() - started_at) * 1000.0
         )
         if result['pose_ok']:
             refined_tvecs.append(result['tvec'].reshape(1, 3))
@@ -187,6 +235,10 @@ for idx, _frame in tqdm(enumerate(_ref_data)):
         rvecs.append(np.array([[np.nan, np.nan, np.nan]]))
         refined_tvecs.append(np.array([[np.nan, np.nan, np.nan]]))
         refined_rvecs.append(np.array([[np.nan, np.nan, np.nan]]))
+        subpix_tvecs.append(np.array([[np.nan, np.nan, np.nan]]))
+        subpix_rvecs.append(np.array([[np.nan, np.nan, np.nan]]))
+        previous_subpix_rvec = None
+        previous_subpix_tvec = None
         refinement_accepted.append(False)
         refinement_rejection_reasons.append("tag_not_detected")
 
@@ -241,6 +293,8 @@ ar_tvecs = np.array(tvecs[start_pulse:end_pulse])
 ar_rvecs = np.array(rvecs[start_pulse:end_pulse])
 ar_refined_tvecs = np.array(refined_tvecs[start_pulse:end_pulse])
 ar_refined_rvecs = np.array(refined_rvecs[start_pulse:end_pulse])
+ar_subpix_tvecs = np.array(subpix_tvecs[start_pulse:end_pulse])
+ar_subpix_rvecs = np.array(subpix_rvecs[start_pulse:end_pulse])
 ar_refinement_accepted = np.array(refinement_accepted[start_pulse:end_pulse], dtype=bool)
 ar_refinement_rejection_reasons = refinement_rejection_reasons[start_pulse:end_pulse]
 
@@ -428,16 +482,32 @@ def align_trajectories(source, target):
 tvecs = ar_tvecs.reshape(-1, 3)
 rvecs = ar_rvecs.reshape(-1, 3)
 refined_tvecs_flat = ar_refined_tvecs.reshape(-1, 3)
+subpix_tvecs_flat = ar_subpix_tvecs.reshape(-1, 3)
 
-# Use first valid rvec as reference frame for both pipelines
-rmat = cv2.Rodrigues(rvecs[1])[0]
+# Use the first valid baseline pose as the shared camera-frame reference.
+baseline_reference_index = int(
+    np.flatnonzero(
+        np.isfinite(rvecs).all(axis=1) & np.isfinite(tvecs).all(axis=1)
+    )[0]
+)
+rmat = cv2.Rodrigues(rvecs[baseline_reference_index])[0]
 rmat_T = rmat.T
 
-tvec_diff = tvecs - tvecs[0]
+
+def _translation_relative_to_first_valid(values):
+    valid_indices = np.flatnonzero(np.isfinite(values).all(axis=1))
+    if len(valid_indices) == 0:
+        return np.full_like(values, np.nan)
+    return values - values[int(valid_indices[0])]
+
+
+tvec_diff = _translation_relative_to_first_valid(tvecs)
 tvec_transformed = (rmat_T @ tvec_diff.T).T
 
-refined_tvec_diff = refined_tvecs_flat - refined_tvecs_flat[0]
+refined_tvec_diff = _translation_relative_to_first_valid(refined_tvecs_flat)
 refined_tvec_transformed = (rmat_T @ refined_tvec_diff.T).T
+subpix_tvec_diff = _translation_relative_to_first_valid(subpix_tvecs_flat)
+subpix_tvec_transformed = (rmat_T @ subpix_tvec_diff.T).T
 
 
 def _error_stats(pred, ref):
@@ -455,6 +525,7 @@ def _error_stats(pred, ref):
     return stats
 
 baseline_stats = _error_stats(tvec_transformed, aligned_mocap)
+subpix_stats = _error_stats(subpix_tvec_transformed, aligned_mocap)
 refined_stats  = _error_stats(refined_tvec_transformed, aligned_mocap)
 
 valid_refinement_frames = np.isfinite(refined_tvecs_flat).all(axis=1)
@@ -475,6 +546,16 @@ print(f"  baseline fallbacks: {fallback_count}")
 print(f"  rejection reasons: {rejection_counts}")
 for k, v in refined_stats.items():
     print(f"  {k}: {v:.4f} m")
+
+print("\n=== Candidate (cornerSubPix + temporally disambiguated IPPE_SQUARE) ===")
+for k, v in subpix_stats.items():
+    print(f"  {k}: {v:.4f} m")
+
+print("\n=== Delta (subpix - baseline, negative = improvement) ===")
+for k in baseline_stats:
+    delta = subpix_stats[k] - baseline_stats[k]
+    arrow = "↓" if delta < 0 else ("↑" if delta > 0 else "=")
+    print(f"  {k}: {delta:+.4f} m  {arrow}")
 
 print("\n=== Delta (refined - baseline, negative = improvement) ===")
 for k in baseline_stats:
@@ -551,6 +632,10 @@ refined_orientation_stats = _orientation_change_errors(
     ar_refined_rvecs.reshape(-1, 3),
     interpolated_mocap_rotations,
 )
+subpix_orientation_stats = _orientation_change_errors(
+    ar_subpix_rvecs.reshape(-1, 3),
+    interpolated_mocap_rotations,
+)
 
 print("\n=== Baseline orientation-change error vs mocap ===")
 for key, value in baseline_orientation_stats.items():
@@ -560,11 +645,57 @@ print("\n=== Refined orientation-change error vs mocap ===")
 for key, value in refined_orientation_stats.items():
     print(f"  {key}: {value if key == 'sample_count' else f'{value:.4f} deg'}")
 
+print("\n=== Subpixel-IPPE orientation-change error vs mocap ===")
+for key, value in subpix_orientation_stats.items():
+    print(f"  {key}: {value if key == 'sample_count' else f'{value:.4f} deg'}")
+
+print("\n=== Orientation delta (subpix - baseline, negative = improvement) ===")
+for key in ["mean_abs_deg", "median_abs_deg", "p95_abs_deg", "rmse_deg"]:
+    delta = subpix_orientation_stats[key] - baseline_orientation_stats[key]
+    arrow = "↓" if delta < 0 else ("↑" if delta > 0 else "=")
+    print(f"  {key}: {delta:+.4f} deg  {arrow}")
+
 print("\n=== Orientation delta (refined - baseline, negative = improvement) ===")
 for key in ["mean_abs_deg", "median_abs_deg", "p95_abs_deg", "rmse_deg"]:
     delta = refined_orientation_stats[key] - baseline_orientation_stats[key]
     arrow = "↓" if delta < 0 else ("↑" if delta > 0 else "=")
     print(f"  {key}: {delta:+.4f} deg  {arrow}")
+
+# %%
+def _timing_stats(values):
+    values = np.asarray(values, dtype=np.float64)
+    return {
+        "mean_ms": float(np.mean(values)),
+        "median_ms": float(np.median(values)),
+        "p95_ms": float(np.percentile(values, 95)),
+    }
+
+
+print("\n=== Pose algorithm runtime (excludes undistortion and detection) ===")
+for algorithm_name, values in algorithm_timings_ms.items():
+    print(f"  {algorithm_name}: {_timing_stats(values)}")
+
+benchmark_summary = {
+    "baseline": {
+        "translation": baseline_stats,
+        "orientation": baseline_orientation_stats,
+        "timing": _timing_stats(algorithm_timings_ms["baseline"]),
+    },
+    "subpix_ippe_temporal": {
+        "translation": subpix_stats,
+        "orientation": subpix_orientation_stats,
+        "timing": _timing_stats(algorithm_timings_ms["subpix_ippe_temporal"]),
+    },
+    "internal_lines": {
+        "translation": refined_stats,
+        "orientation": refined_orientation_stats,
+        "timing": _timing_stats(algorithm_timings_ms["internal_lines"]),
+        "accepted_refinements": accepted_count,
+        "baseline_fallbacks": fallback_count,
+        "rejection_reasons": rejection_counts,
+    },
+}
+benchmark_summary
 
 # %% [markdown]
 # ### Evaluating a section to see everything is right
@@ -581,6 +712,7 @@ specs = [
 ]
 for i, label, ylim in specs:
     axes[i].plot(tvec_transformed[:, i],         label=f"baseline {label}", color='tab:blue',   alpha=0.8)
+    axes[i].plot(subpix_tvec_transformed[:, i],  label=f"subpix {label}",   color='tab:purple', alpha=0.8)
     axes[i].plot(refined_tvec_transformed[:, i], label=f"refined {label}",  color='tab:green',  alpha=0.8)
     axes[i].plot(aligned_mocap[:, i],            label=f"mocap {label}",    color='tab:orange', linestyle='--')
     axes[i].set_ylabel(f"Translation ({label})")
@@ -596,6 +728,7 @@ plt.show()
 fig2, axes2 = plt.subplots(1, 2, figsize=(14, 5))
 axes2[0].plot(aligned_mocap[:, 0],           aligned_mocap[:, 2],              label="mocap",    linestyle='--', color='tab:orange')
 axes2[0].plot(tvec_transformed[:, 0],        tvec_transformed[:, 2],           label="baseline", color='tab:blue')
+axes2[0].plot(subpix_tvec_transformed[:, 0], subpix_tvec_transformed[:, 2],    label="subpix",   color='tab:purple')
 axes2[0].plot(refined_tvec_transformed[:, 0], refined_tvec_transformed[:, 2],  label="refined",  color='tab:green')
 axes2[0].set_xlabel("X (m)")
 axes2[0].set_ylabel("Z (m)")
@@ -605,6 +738,7 @@ axes2[0].grid(True, alpha=0.3)
 
 axes2[1].plot(aligned_mocap[:, 0],           aligned_mocap[:, 1],              label="mocap",    linestyle='--', color='tab:orange')
 axes2[1].plot(tvec_transformed[:, 0],        tvec_transformed[:, 1],           label="baseline", color='tab:blue')
+axes2[1].plot(subpix_tvec_transformed[:, 0], subpix_tvec_transformed[:, 1],    label="subpix",   color='tab:purple')
 axes2[1].plot(refined_tvec_transformed[:, 0], refined_tvec_transformed[:, 1],  label="refined",  color='tab:green')
 axes2[1].set_xlabel("X (m)")
 axes2[1].set_ylabel("Y (m)")
@@ -615,5 +749,68 @@ axes2[1].grid(True, alpha=0.3)
 plt.tight_layout()
 plt.show()
 
-# %%
+# %% [markdown]
+# ## X-Z trajectory: without vs with temporal pose refinement
 
+# %%
+xz_output_path = os.path.join(
+    _reference_recording_folder,
+    "xz_trajectory_without_vs_with_temporal_refinement.png",
+)
+
+fig_xz, axes_xz = plt.subplots(
+    1,
+    2,
+    figsize=(14, 6),
+    sharex=True,
+    sharey=True,
+)
+
+axes_xz[0].plot(
+    aligned_mocap[:, 0],
+    aligned_mocap[:, 2],
+    label="mocap",
+    color="tab:orange",
+    linestyle="--",
+    linewidth=2,
+)
+axes_xz[0].plot(
+    tvec_transformed[:, 0],
+    tvec_transformed[:, 2],
+    label="without refinement",
+    color="tab:blue",
+    alpha=0.85,
+)
+axes_xz[0].set_title("Without temporal refinement")
+
+axes_xz[1].plot(
+    aligned_mocap[:, 0],
+    aligned_mocap[:, 2],
+    label="mocap",
+    color="tab:orange",
+    linestyle="--",
+    linewidth=2,
+)
+axes_xz[1].plot(
+    subpix_tvec_transformed[:, 0],
+    subpix_tvec_transformed[:, 2],
+    label="with temporal IPPE refinement",
+    color="tab:purple",
+    alpha=0.85,
+)
+axes_xz[1].set_title("With temporal IPPE refinement")
+
+for axis in axes_xz:
+    axis.set_xlabel("X translation (m)")
+    axis.set_ylabel("Z translation (m)")
+    axis.grid(True, alpha=0.3)
+    axis.legend(loc="best")
+    axis.set_aspect("equal", adjustable="box")
+
+fig_xz.suptitle("X-Z trajectory comparison")
+fig_xz.tight_layout()
+fig_xz.savefig(xz_output_path, dpi=180, bbox_inches="tight")
+print(f"xz_trajectory_plot={xz_output_path}")
+plt.show()
+
+# %%
