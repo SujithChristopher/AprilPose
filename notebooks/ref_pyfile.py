@@ -19,7 +19,7 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(1, os.path.dirname(_script_dir))
 sys.path.insert(1, os.path.join(os.path.dirname(_script_dir), 'scripts'))
 from pd_support import *
-from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Rotation as R, Slerp
 import polars as pl
 import os
 from scipy.interpolate import interp1d
@@ -483,6 +483,90 @@ for k in baseline_stats:
     print(f"  {k}: {delta:+.4f} m  {arrow}")
 
 # %% [markdown]
+# ## Orientation error against mocap
+#
+# Compare frame-to-frame rotation magnitudes on SO(3). This is invariant to the
+# fixed axis convention difference between OptiTrack and the AprilTag frame.
+
+# %%
+mocap_quaternions = mocap_df[["rb_ang_x", "rb_ang_y", "rb_ang_z", "rb_ang_w"]].to_numpy()
+mocap_quaternion_norms = np.linalg.norm(mocap_quaternions, axis=1)
+mocap_rotation_valid = mocap_quaternion_norms > 1e-12
+mocap_elapsed_s = mocap_df["seconds"].to_numpy()[mocap_rotation_valid].astype(np.float64)
+mocap_elapsed_s -= mocap_elapsed_s[0]
+mocap_rotations = R.from_quat(
+    mocap_quaternions[mocap_rotation_valid] / mocap_quaternion_norms[mocap_rotation_valid, None]
+)
+mocap_slerp = Slerp(mocap_elapsed_s, mocap_rotations)
+
+camera_times_ns = ar_df["time"].to_numpy().astype("datetime64[ns]").astype(np.int64)
+camera_elapsed_s = (camera_times_ns - camera_times_ns[0]).astype(np.float64) / 1e9
+orientation_time_valid = (
+    (camera_elapsed_s >= mocap_elapsed_s[0])
+    & (camera_elapsed_s <= mocap_elapsed_s[-1])
+)
+
+interpolated_mocap_rotations = [None] * len(camera_elapsed_s)
+valid_mocap_at_camera = mocap_slerp(camera_elapsed_s[orientation_time_valid])
+for position, frame_index in enumerate(np.flatnonzero(orientation_time_valid)):
+    interpolated_mocap_rotations[frame_index] = valid_mocap_at_camera[position]
+
+
+def _orientation_change_errors(tag_rvecs, mocap_at_camera):
+    signed_errors = []
+    absolute_errors = []
+    previous_tag = None
+    previous_mocap = None
+
+    for rvec, mocap_rotation in zip(tag_rvecs, mocap_at_camera):
+        if mocap_rotation is None or not np.isfinite(rvec).all():
+            previous_tag = None
+            previous_mocap = None
+            continue
+
+        tag_rotation = R.from_rotvec(rvec)
+        if previous_tag is not None and previous_mocap is not None:
+            tag_delta_deg = np.degrees((previous_tag.inv() * tag_rotation).magnitude())
+            mocap_delta_deg = np.degrees((previous_mocap.inv() * mocap_rotation).magnitude())
+            error = float(tag_delta_deg - mocap_delta_deg)
+            signed_errors.append(error)
+            absolute_errors.append(abs(error))
+
+        previous_tag = tag_rotation
+        previous_mocap = mocap_rotation
+
+    signed_errors = np.asarray(signed_errors, dtype=np.float64)
+    absolute_errors = np.asarray(absolute_errors, dtype=np.float64)
+    return {
+        "sample_count": len(signed_errors),
+        "mean_abs_deg": float(np.mean(absolute_errors)),
+        "median_abs_deg": float(np.median(absolute_errors)),
+        "p95_abs_deg": float(np.percentile(absolute_errors, 95)),
+        "rmse_deg": float(np.sqrt(np.mean(signed_errors ** 2))),
+    }
+
+
+baseline_orientation_stats = _orientation_change_errors(rvecs, interpolated_mocap_rotations)
+refined_orientation_stats = _orientation_change_errors(
+    ar_refined_rvecs.reshape(-1, 3),
+    interpolated_mocap_rotations,
+)
+
+print("\n=== Baseline orientation-change error vs mocap ===")
+for key, value in baseline_orientation_stats.items():
+    print(f"  {key}: {value if key == 'sample_count' else f'{value:.4f} deg'}")
+
+print("\n=== Refined orientation-change error vs mocap ===")
+for key, value in refined_orientation_stats.items():
+    print(f"  {key}: {value if key == 'sample_count' else f'{value:.4f} deg'}")
+
+print("\n=== Orientation delta (refined - baseline, negative = improvement) ===")
+for key in ["mean_abs_deg", "median_abs_deg", "p95_abs_deg", "rmse_deg"]:
+    delta = refined_orientation_stats[key] - baseline_orientation_stats[key]
+    arrow = "↓" if delta < 0 else ("↑" if delta > 0 else "=")
+    print(f"  {key}: {delta:+.4f} deg  {arrow}")
+
+# %% [markdown]
 # ### Evaluating a section to see everything is right
 
 # %%
@@ -532,5 +616,4 @@ plt.tight_layout()
 plt.show()
 
 # %%
-
 

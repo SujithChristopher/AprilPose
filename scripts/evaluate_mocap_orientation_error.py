@@ -72,8 +72,10 @@ def read_mocap_trajectory(path: Path) -> tuple[np.ndarray, np.ndarray, Rotation]
         raise ValueError(f"Not enough valid mocap rotations in {path}")
     quaternions_xyzw = quaternions_xyzw[valid] / quat_norms[valid][:, None]
     positions_xyz = marker_positions[valid]
-    times = pd.to_datetime(mocap_df.loc[valid, "time"]).astype("int64") / 1e9
-    times = np.asarray(times, dtype=np.float64)
+    # The OptiTrack export already provides elapsed seconds. Converting the
+    # datetime column through its integer representation is unsafe because
+    # pandas may store it at millisecond rather than nanosecond resolution.
+    times = mocap_df.loc[valid, "seconds"].to_numpy(dtype=np.float64)
     times = times - times[0]
 
     rotation = Rotation.from_quat(quaternions_xyzw)
