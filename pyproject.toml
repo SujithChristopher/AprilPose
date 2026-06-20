@@ -27,6 +27,14 @@ dependencies = [
   "tqdm>=4.68.3",
 ]
 
+[project.scripts]
+aprilpose-benchmark = "aprilpose.benchmark.cli:main"
+
+[tool.maturin]
+python-source = "."
+module-name = "aprilpose.aprilpose_rust"
+python-packages = ["aprilpose", "scripts"]
+
 [tool.uv.sources]
 torch = [
   { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },

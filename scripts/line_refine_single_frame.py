@@ -15,9 +15,12 @@ import numpy as np
 from cv2 import aruco
 
 try:
-    from aprilpose_rust import refine_internal_lines_rust
+    from aprilpose.aprilpose_rust import refine_internal_lines_rust
 except ImportError:
-    refine_internal_lines_rust = None
+    try:
+        from aprilpose_rust import refine_internal_lines_rust
+    except ImportError:
+        refine_internal_lines_rust = None
 
 if os.environ.get("APRILPOSE_DISABLE_RUST") == "1":
     refine_internal_lines_rust = None
